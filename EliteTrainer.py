@@ -45,7 +45,7 @@ class EliteTrainer(EnvPlayer, GenData):
         self.device = 'cpu'
         self.net = PokeNet(self.observation_space.shape, self.action_space.n)
         self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr = 0.00025)
+        self.optimizer = torch.optim.AdamW(self.net.parameters(), lr = 0.00025)
         self.loss_fn = torch.nn.SmoothL1Loss()
         self.exploration_rate = 1
         self.decay = 0.01
@@ -57,7 +57,7 @@ class EliteTrainer(EnvPlayer, GenData):
         self.action_id = 0
     def calc_reward(self, last_battle: AbstractBattle, current_battle: AbstractBattle) -> float:
         return self.reward_computing_helper(
-            current_battle, fainted_value=0.5, hp_value=0.1, victory_value=3
+            current_battle, fainted_value=6, hp_value=1, victory_value=30, status_value=0.5
         )
     def optimal_move(self, state) -> int:
         if np.random.rand() < self.exploration_rate:
@@ -94,20 +94,31 @@ class EliteTrainer(EnvPlayer, GenData):
         fainted_mon_opponent = (
             len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6
         )
-
-        # Final vector with 10 components
+        opponent_moves_power = -np.ones(4)
+        opp_moves_dmg_multiplier = np.ones(4)
+        for i, move in enumerate(battle.opponent_active_pokemon.moves.values()):
+            opponent_moves_power[i] = (move.base_power / 100)
+            if move.type:
+                opp_moves_dmg_multiplier[i] = move.type.damage_multiplier(
+                    type_1=battle.active_pokemon.type_1,
+                    type_2=battle.active_pokemon.type_2,
+                    type_chart=self.load_type_chart(9)
+                )
+        # Final vector with 18 components
         final_vector = np.concatenate(
             [
                 moves_base_power,
                 moves_dmg_multiplier,
                 [fainted_mon_team, fainted_mon_opponent],
+                opponent_moves_power, 
+                opp_moves_dmg_multiplier,
             ]
         )
         return np.float32(final_vector)
 
     def describe_embedding(self) -> Space:
-        low = [-1, -1, -1, -1, 0, 0, 0, 0, 0, 0]
-        high = [3, 3, 3, 3, 4, 4, 4, 4, 1, 1]
+        low = [-1, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, 0, 0, 0, 0]
+        high = [3, 3, 3, 3, 4, 4, 4, 4, 1, 1, 3, 3, 3, 3, 4, 4, 4 ,4]
         return Box(
             np.array(low, dtype=np.float32),
             np.array(high, dtype=np.float32),
@@ -143,15 +154,16 @@ class EliteTrainer(EnvPlayer, GenData):
         loss = self.update_Q_online(td_est, td_tgt)
         return (td_est.mean().item(),loss)
     def td_estimate(self, state, action):
-        current_Q = self.net(state, model='online').gather(1, action.view(self.batch_size, 1))
+        current_Q = self.net(state, model='online').view(self.batch_size, -1)
         return current_Q
     @torch.no_grad()
     def td_target(self, reward, next_state, done):
         next_state_Q = self.net(next_state, model = 'online')
         optimal_move = torch.argmax(next_state_Q, dim=1, keepdim=True)
-        next_Q_values = self.net(next_state, model='target').gather(1, optimal_move)
-        return (reward.view(self.batch_size, 1) + (1 - done.float()).view(self.batch_size, 1) * self.gamma * next_Q_values)
+        next_Q_values = self.net(next_state, model='target')
+        return (reward.view(self.batch_size, -1) + (1 - done.float()).view(self.batch_size, -1) * self.gamma * next_Q_values)
     def update_Q_online(self, td_estimate, td_target):
+        #print(td_estimate, td_estimate.shape, td_target, td_target.shape)
         loss = self.loss_fn(td_estimate, td_target)
         self.optimizer.zero_grad()
         loss.backward(retain_graph=True)
@@ -212,7 +224,7 @@ async def main():
         f"Double DQN Evaluation: {env.n_won_battles} victories out of {env.n_finished_battles} episodes")
         train_env.reset_env(restart=True)
         train_env.close(purge=True)
-    n_episodes = 50
+    n_episodes = 1000
     run(train_env, n_episodes)
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
